@@ -67,12 +67,63 @@ if("cuda" IN_LIST FEATURES)
         -DKokkos_ENABLE_CUDA=ON
         -DKokkos_ENABLE_CUDA_LAMBDA=ON
         -DKokkos_ENABLE_CUDA_CONSTEXPR=ON)
-    if(DEFINED ENV{OPENSWMM_KOKKOS_CUDA_ARCH})
+    if(DEFINED ENV{OPENSWMM_KOKKOS_CUDA_ARCH} AND NOT "$ENV{OPENSWMM_KOKKOS_CUDA_ARCH}" STREQUAL "")
         list(APPEND BACKEND_OPTIONS "-DKokkos_ARCH_$ENV{OPENSWMM_KOKKOS_CUDA_ARCH}=ON")
+    elseif(DEFINED ENV{OPENSWMMENGINE_KOKKOS_CUDA_ARCH} AND NOT "$ENV{OPENSWMMENGINE_KOKKOS_CUDA_ARCH}" STREQUAL "")
+        list(APPEND BACKEND_OPTIONS "-DKokkos_ARCH_$ENV{OPENSWMMENGINE_KOKKOS_CUDA_ARCH}=ON")
     else()
-        message(WARNING
-            "kokkos[cuda]: OPENSWMM_KOKKOS_CUDA_ARCH not set — letting Kokkos "
-            "auto-detect the GPU arch (may fail in CI without a visible device).")
+        # vcpkg sanitizes its cmake subprocess environment, so OPENSWMM_KOKKOS_CUDA_ARCH
+        # does not reach this portfile script. Kokkos' GPU auto-detection also fails in
+        # vcpkg's sandboxed build (cannot run device executables during cmake configure).
+        # Fall back to ADA89 (Ada Lovelace SM 8.9) = NVIDIA RTX 2000 Ada series.
+        # To build for a different GPU, set OPENSWMM_KOKKOS_CUDA_ARCH in the environment
+        # or add -DKokkos_ARCH_<ARCH>=ON via VCPKG_CMAKE_CONFIGURE_OPTIONS in a triplet.
+        list(APPEND BACKEND_OPTIONS "-DKokkos_ARCH_ADA89=ON")
+        message(STATUS
+            "kokkos[cuda]: OPENSWMM_KOKKOS_CUDA_ARCH not in vcpkg env -- "
+            "defaulting to ADA89 (Ada Lovelace SM 8.9, RTX 2000 Ada).")
+    endif()
+    # On Windows, neither nvcc_wrapper (bash script) nor Clang (separate install)
+    # may be available. Kokkos 4.7 offers a built-in path: set
+    # Kokkos_ENABLE_COMPILE_AS_CMAKE_LANGUAGE=ON (cmake/kokkos_enable_options.cmake:87).
+    # This tells Kokkos to check CMAKE_CUDA_COMPILER (nvcc) instead of
+    # CMAKE_CXX_COMPILER (cl.exe) when identifying the compiler, which sets
+    # KOKKOS_CXX_COMPILER_ID=NVIDIA and satisfies kokkos_test_cxx_std.cmake:140
+    # without requiring nvcc_wrapper or Clang. cmake's native CUDA language then
+    # compiles device code with nvcc and host C++ with MSVC; MSVC flags (e.g.
+    # -std:c++20 with MSVC colon syntax) are never forwarded to nvcc.
+    if(VCPKG_TARGET_IS_WINDOWS)
+        set(_kokkos_nvcc "")
+        if(DEFINED ENV{CUDA_PATH} AND EXISTS "$ENV{CUDA_PATH}/bin/nvcc.exe")
+            set(_kokkos_nvcc "$ENV{CUDA_PATH}/bin/nvcc.exe")
+        else()
+            foreach(_cuda_ver 13.3 13.2 13.1 13.0 12.8 12.6 12.5 12.4)
+                set(_probe
+                    "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v${_cuda_ver}/bin/nvcc.exe")
+                if(EXISTS "${_probe}")
+                    set(_kokkos_nvcc "${_probe}")
+                    break()
+                endif()
+            endforeach()
+        endif()
+        if(_kokkos_nvcc)
+            message(STATUS "kokkos[cuda] Windows: CUDA language mode (MSVC+nvcc), nvcc=${_kokkos_nvcc}")
+            list(APPEND BACKEND_OPTIONS
+                "-DKokkos_ENABLE_COMPILE_AS_CMAKE_LANGUAGE=ON"
+                "-DCMAKE_CUDA_COMPILER=${_kokkos_nvcc}"
+                "-DCMAKE_CUDA_STANDARD=20"
+                "-DCMAKE_CUDA_STANDARD_REQUIRED=ON"
+                # CUDA 13.x CCCL headers require MSVC standard-conforming preprocessor.
+                # cmake's CUDA language does NOT auto-wrap CMAKE_CXX_FLAGS into -Xcompiler
+                # for nvcc, so the flag must be injected directly via CMAKE_CUDA_FLAGS.
+                # VCPKG_CXX_FLAGS (below) covers regular CXX-only translation units.
+                "-DCMAKE_CUDA_FLAGS=-Xcompiler=/Zc:preprocessor")
+        else()
+            message(FATAL_ERROR
+                "kokkos[cuda] on Windows: nvcc.exe not found. "
+                "Install the CUDA Toolkit and set CUDA_PATH, or install to the "
+                "default path (C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v<ver>).")
+        endif()
     endif()
     set(OPENMP_HINTS)  # no libomp needed for the device build
 elseif("rocm" IN_LIST FEATURES)
@@ -125,6 +176,19 @@ else()
     endif()
 endif()
 
+# CUDA 13.x CCCL headers (bundled in the CUDA toolkit) require the MSVC
+# standard-conforming preprocessor. cl.exe's legacy default preprocessor
+# triggers a fatal #error in cuda/std/__cccl/preprocessor.h(23):
+#   "MSVC/cl.exe with traditional preprocessor is used ... pass /Zc:preprocessor"
+# When nvcc uses cl.exe as the host compiler it forwards CMAKE_CXX_FLAGS via
+# -Xcompiler, so adding /Zc:preprocessor to VCPKG_CXX_FLAGS (which flows into
+# CMAKE_CXX_FLAGS via the vcpkg toolchain) silences the error and enables the
+# conforming preprocessor for all Kokkos compilation units.
+if(VCPKG_TARGET_IS_WINDOWS AND "cuda" IN_LIST FEATURES)
+    string(APPEND VCPKG_CXX_FLAGS " /Zc:preprocessor")
+    string(APPEND VCPKG_C_FLAGS " /Zc:preprocessor")
+endif()
+
 # Keep Kokkos' internal debug instrumentation OFF in BOTH the debug and release
 # sub-builds. vcpkg installs a single (release) header set, but under a Debug
 # CMAKE_BUILD_TYPE Kokkos turns KOKKOS_ENABLE_DEBUG on, which changes the
@@ -154,12 +218,14 @@ file(REMOVE_RECURSE
     "${CURRENT_PACKAGES_DIR}/debug/include"
     "${CURRENT_PACKAGES_DIR}/debug/share")
 
-# Kokkos installs helper scripts (hpcbind, nvcc_wrapper) into bin/. For a host
-# build these are unused and trip vcpkg's static-lib bin/ policy, so drop them;
-# for the cuda backend, nvcc_wrapper is the compiler consumers need, so keep it.
-# The rocm/sycl backends compile via external hipcc/icpx (no Kokkos wrapper to
-# keep), so they drop bin/ like the host build.
-if("cuda" IN_LIST FEATURES)
+# Kokkos installs helper scripts (hpcbind, nvcc_wrapper, kokkos_launch_compiler)
+# into bin/. For a host build these are unused and trip vcpkg's static-lib bin/
+# policy, so drop them. For CUDA on Linux: nvcc_wrapper is the compiler consumers
+# need, so keep it. For CUDA on Windows: we use cmake's native CUDA language mode
+# (KOKKOS_COMPILER_IS_KOKKOS_LAUNCH_COMPILER=ON), so consumers use cmake's CUDA
+# language directly instead of kokkos_launch_compiler -- drop bin/ entirely.
+# The rocm/sycl backends drop bin/ like the host build.
+if("cuda" IN_LIST FEATURES AND NOT VCPKG_TARGET_IS_WINDOWS)
     vcpkg_copy_tools(TOOL_NAMES nvcc_wrapper AUTO_CLEAN)
 else()
     file(REMOVE_RECURSE

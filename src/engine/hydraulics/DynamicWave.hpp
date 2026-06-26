@@ -33,6 +33,7 @@
 #include "../core/SimulationOptions.hpp"
 #include "../data/NodeData.hpp"
 #include "../data/LinkData.hpp"
+#include "../../../include/openswmm/engine/openswmm_operator_snapshot.h"
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -40,6 +41,7 @@
 namespace openswmm {
 
 struct SimulationContext;
+class OperatorSnapshotState;
 
 namespace dynwave {
 
@@ -217,10 +219,32 @@ public:
 
     double head_tol   = DEFAULT_HEAD_TOL;
     int    max_trials = DEFAULT_MAX_TRIALS;
+    double min_surf_area = MIN_SURFAREA;
     double omega      = OMEGA;
     SurchargeMethod surcharge_method = SurchargeMethod::EXTRAN;
     NodeContinuity  node_continuity  = NodeContinuity::EXPLICIT;
     bool   anderson_accel = false;       ///< Enable Anderson acceleration
+
+    /**
+     * @brief Populate an operator snapshot from current solver state.
+     *
+     * @details Fills all fields of the snapshot struct with pointers into
+     *          the solver's own buffers (zero-copy where possible).  For
+     *          fields stored in AoS (xnode_, dps_state_) or std::vector<bool>
+     *          (bypassed_), caller-provided staging buffers are filled and
+     *          pointed to.
+     *
+     * @param ctx            Simulation context (for node/link topology and state).
+     * @param dt             Current routing timestep (seconds).
+     * @param iters          Number of Picard iterations used.
+     * @param did_converge   True if Picard loop converged this substep.
+     * @param snap           [out] Snapshot structure to populate.
+     * @param staging        [in]  OperatorSnapshotState providing staging buffers.
+     */
+    void populateSnapshot(const SimulationContext& ctx, double dt,
+                          int iters, bool did_converge,
+                          SWMM_OperatorSnapshot& snap,
+                          OperatorSnapshotState& staging) const;
 
     /// Evaporation rate (ft/s) — set by Router::step() each timestep so that
     /// solveMomentumBatch can recompute dq6 per Picard iteration (Gap #14).
@@ -316,17 +340,7 @@ private:
     // Per-timestep constants
     double dt_gravity_ = 0.0;            ///< dt * GRAVITY (set once per timestep)
 
-    // --- env-gated bit-parity trace (zero runtime cost when SWMM_TRACE_RSTEP
-    //     is unset).  Dumps per-iteration converged-state doubles (%.17g) for
-    //     a single target routing step so the refactored trace can be diffed
-    //     against an lldb dump of the pristine legacy binary to find the first
-    //     element whose double diverges (below the float32 .out floor). ---
-    int          trace_rstep_      = -2;   ///< -2 unparsed; -1 off; >=0 target routing step
-    int          routing_step_idx_ = -1;   ///< increments each execute() call
     bool         last_converged_   = false; ///< final Picard converged flag of last execute()
-    std::string  trace_file_;              ///< SWMM_TRACE_FILE destination
-    void maybeInitTrace();
-    void dumpTrace(SimulationContext& ctx, int iter);
 
     /// Effective minimum nodal surface area (ft²) used as a floor for the
     /// dy = dV/surf_area Picard update.  Legacy `MinSurfArea` is the user
@@ -433,6 +447,13 @@ private:
     void initNodeStates(SimulationContext& ctx);
     void findBypassedLinks(const SimulationContext& ctx);
     void computeLinkGeometry(SimulationContext& ctx);
+    /// Recompute conduit evap/seepage loss rates PER Picard iteration, matching
+    /// legacy dwflow_findConduitFlow which calls link_getLossRate every iteration
+    /// for non-dry conduits (and skips DRY/UP_DRY/DN_DRY via its early return,
+    /// leaving the prior loss rate untouched). Uses the current-iteration depth
+    /// and the faithful transect top width. Replaces the once-per-step
+    /// Router::computeConduitLosses for the DYNWAVE path.
+    void recomputeConduitLosses(SimulationContext& ctx, double dt);
     void solveMomentumBatch(SimulationContext& ctx, double dt, int step);
     void classifyMomentumCategories(SimulationContext& ctx);
 
@@ -471,6 +492,15 @@ public:
     /// Mutable reference to the per-node sumdqdh accumulator at index n.
     double& nodeSumDqdh(int n) { return xnode_.sumdqdh[static_cast<std::size_t>(n)]; }
 
+    /// Number of conduit links (subset of n_links).
+    int numConduits() const noexcept { return n_conduits_; }
+
+    /// Set non-owning pointer to snapshot state for iteration history recording.
+    void setSnapshotState(OperatorSnapshotState* s) noexcept { snap_state_ = s; }
+
+    /// True if the last execute() call's Picard loop converged.
+    bool lastConverged() const noexcept { return last_converged_; }
+
     /// Access per-node AA skip flags (read-only, for testing/diagnostics).
     const std::vector<uint8_t>& aaSkipFlags() const { return aa_skip_; }
 
@@ -501,6 +531,11 @@ private:
 
     /// Spatial smoothing of Preissmann Number across node boundaries.
     void spatialSmoothP(const SimulationContext& ctx);
+
+    // Iteration history
+    OperatorSnapshotState* snap_state_ = nullptr;      ///< Non-owning; set by SWMMEngine
+    std::vector<double> depth_residual_;                ///< [n_nodes_] for recording per-iter residuals
+    bool last_converged_ = false;                       ///< Result of last execute() Picard loop
 };
 
 } // namespace dynwave

@@ -50,6 +50,7 @@ if(OPENSWMM_GPU_BACKEND STREQUAL "stub")
     add_library(openswmm_gpu_stub SHARED GpuPluginStub.cpp)
     target_include_directories(openswmm_gpu_stub
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../solver)
+    target_compile_definitions(openswmm_gpu_stub PRIVATE OPENSWMM_GPU_PLUGIN_BUILD)
     set_target_properties(openswmm_gpu_stub PROPERTIES
         OUTPUT_NAME "openswmm_gpu_stub" ${_OPENSWMM_GPU_COMMON_PROPS})
     message(STATUS "OpenSWMM Engine: GPU plugin backend = stub (no Kokkos)")
@@ -74,7 +75,16 @@ elseif(OPENSWMM_GPU_BACKEND STREQUAL "omp")
     target_link_libraries(openswmm_gpu_omp PRIVATE
         Kokkos::kokkos
         SUNDIALS::cvode)
-    target_compile_definitions(openswmm_gpu_omp PRIVATE OPENSWMM_GPU_EXECSPACE_OPENMP)
+    target_compile_definitions(openswmm_gpu_omp PRIVATE
+        OPENSWMM_GPU_EXECSPACE_OPENMP OPENSWMM_GPU_PLUGIN_BUILD)
+    # MSVC's legacy `/openmp` (OpenMP 2.0/2.5) lacks omp_get_level(), which
+    # Kokkos' OpenMP backend (<OpenMP/Kokkos_OpenMP_Instance.hpp>) calls — it
+    # fails to compile with C3861. `/openmp:llvm` provides OpenMP 3.0+ runtime
+    # routines. Added as a PRIVATE option so it follows (and overrides, with a
+    # benign D9025) any `/openmp` injected via Kokkos' interface flags.
+    if(MSVC)
+        target_compile_options(openswmm_gpu_omp PRIVATE /openmp:llvm)
+    endif()
     if(OPENSWMM_WITH_HYPRE)
         find_package(HYPRE CONFIG REQUIRED)
         target_sources(openswmm_gpu_omp PRIVATE KokkosAmgPreconditioner.cpp)
@@ -91,9 +101,17 @@ elseif(OPENSWMM_GPU_BACKEND STREQUAL "cuda")
     # execution space changes (OPENSWMM_GPU_EXECSPACE_CUDA -> Kokkos::Cuda) and
     # the probe reports an NVIDIA device. Requires a CUDA-enabled Kokkos
     # (Kokkos_ENABLE_CUDA=ON, built for the target Kokkos_ARCH_*) and a SUNDIALS
-    # with the Kokkos N_Vector. Kokkos drives CUDA compilation of the device
-    # lambdas; configure the plugin with Kokkos' nvcc_wrapper as CMAKE_CXX_COMPILER
-    # (or a CUDA-clang toolchain) — see docs/2D_GPU_PHASE2_VERIFICATION.md.
+    # with the Kokkos N_Vector.
+    #
+    # Compiler strategy by platform:
+    #   Linux/macOS — configure the plugin with Kokkos' nvcc_wrapper as
+    #                 CMAKE_CXX_COMPILER (or a CUDA-clang toolchain).
+    #   Windows     — nvcc_wrapper is a bash script and unavailable on Windows.
+    #                 Use CMake's native CUDA language instead: CMake invokes nvcc
+    #                 with cl.exe as the host compiler, then MSVC for the remaining
+    #                 C++ translation units. Source files containing Kokkos device
+    #                 lambdas are tagged LANGUAGE CUDA so nvcc compiles them.
+    #
     # NOT buildable on macOS/Apple Silicon (no nvcc); built on a CUDA host/CI.
     find_package(Kokkos REQUIRED)
     find_package(SUNDIALS REQUIRED COMPONENTS cvode nveckokkos)
@@ -104,9 +122,35 @@ elseif(OPENSWMM_GPU_BACKEND STREQUAL "cuda")
             "Kokkos_ENABLE_CUDA=ON (found devices: ${Kokkos_DEVICES})")
     endif()
 
+    # On Windows, enable CMake's CUDA language so nvcc (with cl.exe as host) can
+    # compile device-lambda sources that nvcc_wrapper would handle on Linux.
+    if(WIN32)
+        enable_language(CUDA)
+        # Propagate the C++20 standard to nvcc; nvcc does not inherit CXX_STANDARD.
+        set(CMAKE_CUDA_STANDARD 20)
+        set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        # Separable compilation is required when device code spans multiple TUs
+        # (Kokkos parallel kernels across GpuPluginCuda + CvodeKokkosSurfaceSolver).
+        set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+    endif()
+
     add_library(openswmm_gpu_cuda SHARED
         GpuPluginCuda.cpp
         CvodeKokkosSurfaceSolver.cpp)
+
+    # On Windows, mark the device-lambda sources so CMake routes them through nvcc.
+    # On Linux, nvcc_wrapper as CMAKE_CXX_COMPILER handles all .cpp files uniformly.
+    if(WIN32)
+        set_source_files_properties(
+            GpuPluginCuda.cpp
+            CvodeKokkosSurfaceSolver.cpp
+            PROPERTIES LANGUAGE CUDA)
+        set_target_properties(openswmm_gpu_cuda PROPERTIES
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            CUDA_SEPARABLE_COMPILATION ON)
+    endif()
+
     target_include_directories(openswmm_gpu_cuda PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../solver
         ${CMAKE_CURRENT_SOURCE_DIR}/../data)
@@ -116,7 +160,8 @@ elseif(OPENSWMM_GPU_BACKEND STREQUAL "cuda")
     target_link_libraries(openswmm_gpu_cuda PRIVATE
         Kokkos::kokkos
         SUNDIALS::cvode)
-    target_compile_definitions(openswmm_gpu_cuda PRIVATE OPENSWMM_GPU_EXECSPACE_CUDA)
+    target_compile_definitions(openswmm_gpu_cuda PRIVATE
+        OPENSWMM_GPU_EXECSPACE_CUDA OPENSWMM_GPU_PLUGIN_BUILD)
     if(OPENSWMM_WITH_HYPRE)
         # Requires a hypre built with its CUDA backend (HYPRE_WITH_CUDA=ON) so
         # BoomerAMG runs in device memory alongside the Kokkos N_Vector. Built
@@ -158,7 +203,8 @@ elseif(OPENSWMM_GPU_BACKEND STREQUAL "hip")
     target_link_libraries(openswmm_gpu_hip PRIVATE
         Kokkos::kokkos
         SUNDIALS::cvode)
-    target_compile_definitions(openswmm_gpu_hip PRIVATE OPENSWMM_GPU_EXECSPACE_HIP)
+    target_compile_definitions(openswmm_gpu_hip PRIVATE
+        OPENSWMM_GPU_EXECSPACE_HIP OPENSWMM_GPU_PLUGIN_BUILD)
     if(OPENSWMM_WITH_HYPRE)
         # Requires a hypre built with its HIP backend (HYPRE_WITH_HIP=ON) so
         # BoomerAMG runs in device memory alongside the Kokkos N_Vector
@@ -202,7 +248,8 @@ elseif(OPENSWMM_GPU_BACKEND STREQUAL "sycl")
     target_link_libraries(openswmm_gpu_sycl PRIVATE
         Kokkos::kokkos
         SUNDIALS::cvode)
-    target_compile_definitions(openswmm_gpu_sycl PRIVATE OPENSWMM_GPU_EXECSPACE_SYCL)
+    target_compile_definitions(openswmm_gpu_sycl PRIVATE
+        OPENSWMM_GPU_EXECSPACE_SYCL OPENSWMM_GPU_PLUGIN_BUILD)
     if(OPENSWMM_WITH_HYPRE)
         # Requires a hypre built with its SYCL backend (HYPRE_WITH_SYCL=ON) so
         # BoomerAMG runs in device memory alongside the Kokkos N_Vector

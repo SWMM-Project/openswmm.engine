@@ -181,7 +181,10 @@ add_gtest_unit(test_engine_subcatch_editor_api test_subcatch_editor_api.cpp)
 add_gtest_unit(test_engine_statistics_bulk_phase3 test_statistics_bulk_phase3.cpp)
 add_gtest_unit(test_engine_runoff_interface_capi test_runoff_interface_capi.cpp)
 add_gtest_unit(test_engine_report_section  test_report_section.cpp)
+add_gtest_unit(test_engine_dps              test_dynamic_preissmann_slot.cpp)
+add_gtest_unit(test_engine_site_drainage    test_site_drainage_model.cpp)
 add_gtest_unit(test_engine_concurrent       test_concurrent_engines.cpp)
+add_gtest_unit(test_operator_snapshot       test_operator_snapshot.cpp)
 add_gtest_unit(test_engine_object_deletion test_object_deletion.cpp)
 add_gtest_unit(test_engine_type_conversion test_type_conversion.cpp)
 add_gtest_unit(test_engine_tags           test_tags.cpp)
@@ -304,6 +307,10 @@ if(OPENSWMM_BUILD_2D)
     # discharge must reach the 2D mesh (it read nodes.outflow≈0 before the fix)
     # and both the 2D and 1D continuity ledgers must close.
     add_gtest_unit(test_engine_2d_outfall_coupling test_2d_outfall_coupling.cpp)
+    # Two-way 1D↔2D JUNCTION coupling regression — a coupled junction must
+    # surcharge above its crown to spill onto the 2D mesh and recapture ponded
+    # surface water through its inlet (both blocked when ponded_area was zeroed).
+    add_gtest_unit(test_engine_2d_junction_coupling test_2d_junction_coupling.cpp)
 endif()
 
 # Golden cross-section parity harness — diffs the new xsect:: implementation

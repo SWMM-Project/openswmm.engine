@@ -35,6 +35,9 @@
 #include "hydraulics/ForceMain.hpp"
 #include "hydraulics/Node.hpp"
 #include "core/SimulationContext.hpp"
+#include "core/UnitConversion.hpp"
+
+#include <openswmm/engine/openswmm_engine.h>
 
 #ifndef BENCHMARK_DATA_DIR
 #  define BENCHMARK_DATA_DIR ""
@@ -42,6 +45,66 @@
 
 using namespace openswmm;
 using namespace openswmm::dynwave;
+
+static SimulationContext buildSingleConduitContext(double diameter,
+                                                   double length,
+                                                   double depth) {
+    SimulationContext ctx;
+    const double drop = 0.1;
+
+    ctx.options.routing_step = 1.0;
+    ctx.options.lengthening_step = 0.0;
+    ctx.options.flow_units = FlowUnits::CFS;
+    ctx.options.routing_model = RoutingModel::DYNWAVE;
+
+    ctx.nodes.resize(2);
+    ctx.nodes.type[0] = NodeType::JUNCTION;
+    ctx.nodes.type[1] = NodeType::JUNCTION;
+    ctx.nodes.invert_elev[0] = 100.0;
+    ctx.nodes.invert_elev[1] = ctx.nodes.invert_elev[0] - drop;
+    ctx.nodes.full_depth[0] = 20.0;
+    ctx.nodes.full_depth[1] = 20.0;
+    ctx.nodes.depth[0] = depth;
+    ctx.nodes.depth[1] = depth + drop;
+    ctx.nodes.head[0] = ctx.nodes.invert_elev[0] + depth;
+    ctx.nodes.head[1] = ctx.nodes.invert_elev[1] + ctx.nodes.depth[1];
+    ctx.nodes.volume[0] = node::getVolume(ctx.nodes, 0, depth, &ctx.tables);
+    ctx.nodes.volume[1] = node::getVolume(ctx.nodes, 1, ctx.nodes.depth[1], &ctx.tables);
+    ctx.nodes.full_volume[0] = node::getVolume(ctx.nodes, 0, ctx.nodes.full_depth[0], &ctx.tables);
+    ctx.nodes.full_volume[1] = node::getVolume(ctx.nodes, 1, ctx.nodes.full_depth[1], &ctx.tables);
+    ctx.nodes.crown_elev[0] = ctx.nodes.invert_elev[0] + diameter;
+    ctx.nodes.crown_elev[1] = ctx.nodes.invert_elev[1] + diameter;
+
+    ctx.links.resize(1);
+    ctx.links.type[0] = LinkType::CONDUIT;
+    ctx.links.node1[0] = 0;
+    ctx.links.node2[0] = 1;
+    ctx.links.offset1[0] = 0.0;
+    ctx.links.offset2[0] = 0.0;
+    ctx.links.length[0] = length;
+    ctx.links.mod_length[0] = length;
+    ctx.links.barrels[0] = 1;
+    ctx.links.roughness[0] = 0.013;
+    ctx.links.slope[0] = drop / length;
+    ctx.links.xsect_shape[0] = XsectShape::CIRCULAR;
+
+    XSectParams xs;
+    double p[4] = {diameter, 0.0, 0.0, 0.0};
+    xsect::setParams(xs, static_cast<int>(XSectShape::CIRCULAR), p, 1.0);
+    ctx.links.xsect_y_full[0] = xs.y_full;
+    ctx.links.xsect_a_full[0] = xs.a_full;
+    ctx.links.xsect_w_max[0] = xs.w_max;
+    ctx.links.xsect_r_full[0] = xs.r_full;
+    ctx.links.xsect_s_full[0] = xs.s_full;
+    ctx.links.xsect_s_max[0] = xs.s_max;
+    ctx.links.xsect_y_bot[0] = xs.y_bot;
+    ctx.links.xsect_a_bot[0] = xs.a_bot;
+    ctx.links.xsect_s_bot[0] = xs.s_bot;
+    ctx.links.xsect_r_bot[0] = xs.r_bot;
+    ctx.links.flow[0] = 0.0;
+
+    return ctx;
+}
 
 // ============================================================================
 // DW constants match legacy
@@ -125,8 +188,37 @@ TEST(DWSolver, DefaultParametersMatchLegacy) {
     DWSolver solver;
     EXPECT_DOUBLE_EQ(solver.head_tol, DEFAULT_HEAD_TOL);
     EXPECT_EQ(solver.max_trials, DEFAULT_MAX_TRIALS);
+    EXPECT_DOUBLE_EQ(solver.min_surf_area, MIN_SURFAREA);
     EXPECT_DOUBLE_EQ(solver.omega, OMEGA);
     EXPECT_EQ(solver.surcharge_method, SurchargeMethod::EXTRAN);
+}
+
+TEST(RouterInit, ConvertsDwOptionsToInternalUnitsUS) {
+    SimulationContext ctx = buildSingleConduitContext(3.0, 100.0, 1.0);
+    ctx.options.flow_units = FlowUnits::CFS;
+    ctx.options.head_tol = 0.25;
+    ctx.options.min_surf_area = 20.0;
+
+    Router router;
+    router.init(ctx, RouteModel::DYNWAVE);
+
+    EXPECT_DOUBLE_EQ(router.dwSolver().head_tol, 0.25);
+    EXPECT_DOUBLE_EQ(router.dwSolver().min_surf_area, 20.0);
+}
+
+TEST(RouterInit, ConvertsDwOptionsToInternalUnitsSI) {
+    SimulationContext ctx = buildSingleConduitContext(3.0, 100.0, 1.0);
+    ctx.options.flow_units = FlowUnits::LPS;
+    ctx.options.head_tol = 0.3048;
+    ctx.options.min_surf_area = 1.0;
+
+    Router router;
+    router.init(ctx, RouteModel::DYNWAVE);
+
+    double ucf_len = ucf::UCF(ucf::LENGTH, ctx.options);
+    EXPECT_NEAR(router.dwSolver().head_tol, ctx.options.head_tol / ucf_len, 1e-12);
+    EXPECT_NEAR(router.dwSolver().min_surf_area,
+                ctx.options.min_surf_area / (ucf_len * ucf_len), 1e-12);
 }
 
 // ============================================================================
@@ -524,6 +616,35 @@ TEST(NodeHydraulics, StorageSurfAreaFunctional) {
     EXPECT_NEAR(sa, 500.0, 1.0);
 }
 
+TEST(NodeHydraulics, StorageSurfAreaCanBeBelowMinSurfaceArea) {
+    NodeData nodes;
+    nodes.resize(1);
+    nodes.type[0] = NodeType::STORAGE;
+    nodes.full_depth[0] = 10.0;
+    nodes.storage_curve[0] = -1;
+    nodes.storage_a[0] = 1.0;
+    nodes.storage_b[0] = 0.0;
+    nodes.storage_c[0] = 0.0;
+
+    double sa = node::getSurfArea(nodes, 0, 5.0);
+    EXPECT_DOUBLE_EQ(sa, 1.0);
+}
+
+TEST(DynamicWaveNodeArea, RepresentativeLinkHalfAreaExceedsConfiguredFloor) {
+    SimulationContext ctx = buildSingleConduitContext(3.0, 100.0, 1.0);
+    ctx.options.min_surf_area = 1.0;
+
+    XSectParams xs;
+    double p[4] = {3.0, 0.0, 0.0, 0.0};
+    xsect::setParams(xs, static_cast<int>(XSectShape::CIRCULAR), p, 1.0);
+
+    double top_width = xsect::getWofY(xs, 1.0);
+    double link_half_area = (top_width + top_width) * ctx.links.length[0] / 4.0;
+
+    ASSERT_GT(link_half_area, ctx.options.min_surf_area);
+    ASSERT_GT(link_half_area, MIN_SURFAREA);
+}
+
 // ============================================================================
 // Dynamic Preissmann Slot (DPS) tests
 // Sharior, Hodges & Vasconcelos (2023)
@@ -622,6 +743,7 @@ protected:
             ctx.links.xsect_shape[i] = XsectShape::CIRCULAR;
             ctx.links.xsect_y_full[i] = 2.0;
             ctx.links.xsect_a_full[i] = M_PI;  // π·1²
+            ctx.links.xsect_r_full[i] = 0.5;   // full-flow hyd. radius D/4 (2 ft pipe)
             ctx.links.xsect_w_max[i] = 2.0;
             C.roughness[cr] = 0.013;
             C.length[cr] = 400.0;
@@ -991,42 +1113,48 @@ TEST(DPS, OpenShapesExcluded) {
 // ============================================================================
 
 TEST_F(AASkipFlagTest, DPS_AsAccumulatesPositively) {
-    // Surcharge a single pipe and verify that dps_.As grows monotonically
-    // (within numerical noise) over multiple timesteps while head rises.
+    // Verify that dps_.As grows monotonically over multiple timesteps while
+    // head rises.
     //
     // This is the regression test for the original silent As=0 defect:
     // when applyDPSGeometry derived dAs from (area_mid − A_full) it always
     // produced dAs = −As_prev because the batch XSect kernel clamps depth
     // to y_full, so As never accumulated and the slot was a no-op.
+    //
+    // The head-first formulation gates the slot on the conduit MIDPOINT depth
+    // (hs_iter = max(depth_mid − y_full, 0)), so BOTH ends of a conduit must sit
+    // above crown for its slot to accumulate. We surcharge both junctions and
+    // sustain inflow at both so conduit 0 stays pressurized across the Picard
+    // solve; node 2 remains the free outfall, giving the chain an outlet so the
+    // continuity solve stays well-conditioned. (The fixture also sets a non-zero
+    // xsect_r_full — without it the surcharged hyd-radius override is 0 and the
+    // Manning term divides by zero, NaN-ing the depths and silently resetting
+    // the slot.)
     initSolver(SurchargeMethod::DYNAMIC_SLOT);
 
     const double crown = ctx.links.xsect_y_full[0];  // 2.0 ft
 
-    // Surcharge J0 well above crown; J1 below crown to drive flow downstream.
-    ctx.nodes.depth[0] = crown + 0.50;
-    ctx.nodes.old_depth[0] = crown + 0.50;
-    ctx.nodes.head[0] = ctx.nodes.invert_elev[0] + crown + 0.50;
-    ctx.nodes.sur_depth[0] = 10.0;  // permit head above crown
-    ctx.nodes.lat_flow[0] = 50.0;    // sustained inflow
+    auto surchargeChain = [&](double above) {
+        for (int i = 0; i < 2; ++i) {
+            ctx.nodes.depth[i]     = crown + above;
+            ctx.nodes.old_depth[i] = crown + above;
+            ctx.nodes.head[i]      = ctx.nodes.invert_elev[i] + crown + above;
+            ctx.nodes.sur_depth[i] = 10.0;   // permit head above crown
+        }
+        ctx.nodes.lat_flow[0] = 50.0;        // sustained inflow keeps the
+        ctx.nodes.lat_flow[1] = 30.0;        // conduit pressurized
+        ctx.nodes.depth[2]     = 0.5;        // free outfall drains downstream
+        ctx.nodes.old_depth[2] = 0.5;
+        ctx.nodes.head[2]      = ctx.nodes.invert_elev[2] + 0.5;
+    };
 
-    ctx.nodes.depth[1] = 0.5;
-    ctx.nodes.old_depth[1] = 0.5;
-    ctx.nodes.head[1] = ctx.nodes.invert_elev[1] + 0.5;
-
-    ctx.nodes.depth[2] = 0.5;
-    ctx.nodes.old_depth[2] = 0.5;
-    ctx.nodes.head[2] = ctx.nodes.invert_elev[2] + 0.5;
-
-    // First execute: As starts at zero, should accumulate as head rises.
+    surchargeChain(0.5);
     solver.execute(ctx, 1.0);
     const auto& dps0 = solver.dpsState();
     ASSERT_GE(dps0.As.size(), 1u);
     double As_after_step1 = dps0.As[0];
 
-    // Push J0 head up further and run another step.
-    ctx.nodes.depth[0] = crown + 1.0;
-    ctx.nodes.old_depth[0] = crown + 1.0;
-    ctx.nodes.head[0] = ctx.nodes.invert_elev[0] + crown + 1.0;
+    surchargeChain(1.0);
     solver.execute(ctx, 1.0);
     double As_after_step2 = solver.dpsState().As[0];
 
@@ -1042,27 +1170,25 @@ TEST_F(AASkipFlagTest, DPS_PastAsInvariantUnderPDecay) {
     // must NOT be rewritten when P decays in time.  With the head-first
     // formulation, dAs = T_s · dhs.  If dhs ≈ 0 (held-fixed surcharge) and
     // only P changes, As must stay (within ε) at its value before the decay.
+    // Hold the whole chain at a uniform, fixed head (zero gradient, junction
+    // downstream boundary) so dhs ≈ 0 every step and the surcharge is sustained.
+    // The slot is gated on the conduit midpoint depth; a free outfall would
+    // drain the chain below crown and the slot would (correctly) reset, making
+    // this invariance check vacuous.
+    ctx.nodes.type[2] = NodeType::JUNCTION;
     initSolver(SurchargeMethod::DYNAMIC_SLOT);
 
-    const double crown = ctx.links.xsect_y_full[0];
+    auto setUniformHead = [&](double head) {
+        for (int i = 0; i < 3; ++i) {
+            ctx.nodes.head[i]      = head;
+            ctx.nodes.depth[i]     = head - ctx.nodes.invert_elev[i];
+            ctx.nodes.old_depth[i] = head - ctx.nodes.invert_elev[i];
+            ctx.nodes.sur_depth[i] = 10.0;
+        }
+    };
 
-    // Seed a fully-developed surcharge.
-    ctx.nodes.depth[0] = crown + 1.0;
-    ctx.nodes.old_depth[0] = crown + 1.0;
-    ctx.nodes.head[0] = ctx.nodes.invert_elev[0] + crown + 1.0;
-    ctx.nodes.sur_depth[0] = 10.0;
-    ctx.nodes.lat_flow[0] = 50.0;
-
-    ctx.nodes.depth[1] = crown + 1.0;
-    ctx.nodes.old_depth[1] = crown + 1.0;
-    ctx.nodes.head[1] = ctx.nodes.invert_elev[1] + crown + 1.0;
-    ctx.nodes.sur_depth[1] = 10.0;
-
-    ctx.nodes.depth[2] = 0.5;
-    ctx.nodes.old_depth[2] = 0.5;
-    ctx.nodes.head[2] = ctx.nodes.invert_elev[2] + 0.5;
-
-    // Run one step to populate As.
+    // Run one step to populate As at a fully-developed surcharge.
+    setUniformHead(103.0);
     solver.execute(ctx, 1.0);
     const double As_before_decay = solver.dpsState().As[0];
     ASSERT_GT(As_before_decay, 0.0);
@@ -1070,14 +1196,7 @@ TEST_F(AASkipFlagTest, DPS_PastAsInvariantUnderPDecay) {
     // Hold head fixed across subsequent steps so dhs ≈ 0 each step.
     // Many steps allow P to decay substantially via Eq. 22.
     for (int k = 0; k < 50; ++k) {
-        ctx.nodes.depth[0] = crown + 1.0;
-        ctx.nodes.old_depth[0] = crown + 1.0;
-        ctx.nodes.head[0] = ctx.nodes.invert_elev[0] + crown + 1.0;
-
-        ctx.nodes.depth[1] = crown + 1.0;
-        ctx.nodes.old_depth[1] = crown + 1.0;
-        ctx.nodes.head[1] = ctx.nodes.invert_elev[1] + crown + 1.0;
-
+        setUniformHead(103.0);
         solver.execute(ctx, 1.0);
     }
 
@@ -1122,6 +1241,156 @@ TEST(DPS, OptionsDefaultValues) {
     EXPECT_NEAR(opts.dps_target_celerity, 25.0, 1e-10);
     EXPECT_NEAR(opts.dps_alpha, 3.0, 1e-10);
     EXPECT_NEAR(opts.dps_decay_time, 0.5, 1e-10);
+}
+
+// ============================================================================
+// DW Node Continuity Regression — .inp-driven one-step depth update
+//
+// Verifies Eq. 3-22 node continuity for a single junction receiving a known
+// lateral inflow.  After one 1-second routing step with Q_lat = 1 CFS:
+//
+//   ΔV ≈ 0.5 * Q_net * dt         (trapezoidal, first step: old_net = 0)
+//   Δy = ΔV / A_effective          (A_effective = max(Σ½A_link, MIN_SURFAREA))
+//
+// For a junction: V = MIN_SURFAREA * y ⟹ y = V / MIN_SURFAREA.
+// ============================================================================
+
+class DWNodeContinuityTest : public ::testing::Test {
+protected:
+    SWMM_Engine engine_ = nullptr;
+
+    void SetUp() override {
+        engine_ = swmm_engine_create();
+        ASSERT_NE(engine_, nullptr);
+    }
+
+    void TearDown() override {
+        if (engine_) {
+            swmm_engine_close(engine_);
+            swmm_engine_destroy(engine_);
+            engine_ = nullptr;
+        }
+    }
+};
+
+TEST_F(DWNodeContinuityTest, DepthRisesWithForcedLateralInflow) {
+    // Load minimal 1-junction + 1-outfall + 1-conduit model
+    int rc = swmm_engine_open(engine_,
+                               "minimal_conduit.inp",
+                               "minimal_conduit.rpt",
+                               "minimal_conduit.out", nullptr);
+    ASSERT_EQ(rc, SWMM_OK) << "open failed: " << swmm_get_last_error_msg(engine_);
+
+    rc = swmm_engine_initialize(engine_);
+    ASSERT_EQ(rc, SWMM_OK) << "initialize failed: " << swmm_get_last_error_msg(engine_);
+
+    rc = swmm_engine_start(engine_, 0);
+    ASSERT_EQ(rc, SWMM_OK) << "start failed: " << swmm_get_last_error_msg(engine_);
+
+    int j1 = swmm_node_index(engine_, "J1");
+    ASSERT_GE(j1, 0);
+
+    // Confirm initial depth = 0
+    double depth0 = -1.0;
+    swmm_node_get_depth(engine_, j1, &depth0);
+    EXPECT_NEAR(depth0, 0.0, 1e-10);
+
+    // Force a persistent lateral inflow of 1.0 CFS
+    rc = swmm_forcing_node_lat_inflow(engine_, j1, 1.0,
+                                       SWMM_FORCING_OVERRIDE,
+                                       SWMM_FORCING_PERSIST);
+    ASSERT_EQ(rc, SWMM_OK);
+
+    // Execute one simulation step (dt = 1 sec, fixed)
+    double elapsed = 0.0;
+    rc = swmm_engine_step(engine_, &elapsed);
+    ASSERT_EQ(rc, SWMM_OK) << "step failed: " << swmm_get_last_error_msg(engine_);
+    EXPECT_GT(elapsed, 0.0);
+
+    // --- Read post-step state ---
+    double depth1 = 0.0, volume1 = 0.0;
+    swmm_node_get_depth(engine_, j1, &depth1);
+    swmm_node_get_volume(engine_, j1, &volume1);
+
+    // 1) Depth must have increased from zero
+    EXPECT_GT(depth1, 0.0) << "Junction depth should rise with lateral inflow";
+
+    // 2) Volume should be consistent with junction model: V = MIN_SURFAREA * y
+    //    (the volume returned by the API is in internal units: cubic feet)
+    constexpr double MIN_SA = 12.566;  // 4*pi, constants::MIN_SURFAREA
+    EXPECT_NEAR(volume1, MIN_SA * depth1, 1e-6)
+        << "Junction volume must equal MIN_SURFAREA * depth";
+
+    // 3) Verify depth via the continuity relationship:
+    //
+    //    First step: old_net_inflow = 0, so the trapezoidal average gives
+    //    ΔV = 0.5 * Q_net_converged * dt
+    //
+    //    For a quiescent start the outgoing link flow is small (conduit just
+    //    started filling) so Q_net ≈ Q_lat − Q_link_out.  We can't predict
+    //    Q_link_out exactly, but we CAN verify the volume/depth identity and
+    //    that Δy = V / MIN_SURFAREA (since V_old = 0 and V = MIN_SURFAREA * y).
+    //
+    //    A tighter check: depth should be bounded by the pure-inflow case
+    //    (no outgoing link flow):
+    //        y_max = 0.5 * Q_lat * dt / MIN_SURFAREA = 0.5 / 12.566 ≈ 0.0398 ft
+    //
+    double y_upper = 0.5 * 1.0 * 1.0 / MIN_SA;
+    EXPECT_LE(depth1, y_upper + 1e-6)
+        << "Depth must not exceed the pure-inflow upper bound";
+
+    // Clean up
+    swmm_engine_end(engine_);
+}
+
+TEST_F(DWNodeContinuityTest, MultipleStepsAccumulateDepth) {
+    int rc = swmm_engine_open(engine_,
+                               "minimal_conduit.inp",
+                               "minimal_conduit.rpt",
+                               "minimal_conduit.out", nullptr);
+    ASSERT_EQ(rc, SWMM_OK);
+
+    rc = swmm_engine_initialize(engine_);
+    ASSERT_EQ(rc, SWMM_OK);
+
+    rc = swmm_engine_start(engine_, 0);
+    ASSERT_EQ(rc, SWMM_OK);
+
+    int j1 = swmm_node_index(engine_, "J1");
+    ASSERT_GE(j1, 0);
+
+    // Force 10 CFS lateral inflow
+    swmm_forcing_node_lat_inflow(engine_, j1, 10.0,
+                                  SWMM_FORCING_OVERRIDE,
+                                  SWMM_FORCING_PERSIST);
+
+    // Run 10 steps (10 seconds at 1-sec fixed timestep)
+    double prev_depth = 0.0;
+    for (int s = 0; s < 10; ++s) {
+        double elapsed = 0.0;
+        rc = swmm_engine_step(engine_, &elapsed);
+        ASSERT_EQ(rc, SWMM_OK);
+
+        double d = 0.0, v = 0.0;
+        swmm_node_get_depth(engine_, j1, &d);
+        swmm_node_get_volume(engine_, j1, &v);
+
+        // Depth must be monotonically increasing (strong inflow, small outflow)
+        EXPECT_GE(d, prev_depth)
+            << "Depth should be non-decreasing with strong persistent inflow (step " << s << ")";
+
+        // Volume/depth identity
+        constexpr double MIN_SA = 12.566;
+        EXPECT_NEAR(v, MIN_SA * d, 1e-5)
+            << "Volume/depth mismatch at step " << s;
+
+        prev_depth = d;
+    }
+
+    // After 10 seconds of 10 CFS, depth should be substantial
+    EXPECT_GT(prev_depth, 0.0);
+
+    swmm_engine_end(engine_);
 }
 
 // ============================================================================
