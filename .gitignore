@@ -1,12 +1,34 @@
 
 .DS_Store
 
+# Working notes not intended for version control
+doc/FlashX_SWMM_crosswalk.md
+doc/Verification_Implementation_Plan.md
+
 # Eclipse Stuff
 .metadata/
 .settings/
 
 build/
+build-*/
 nrtests/
 upload/
 
 *_export.h
+docs/html/
+
+# add python ignore files and file types
+python/build/
+python/dist/
+python/OpenSWMMCore.egg-info/
+python/_skbuild/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info
+*.manifest
+*.spec  
+

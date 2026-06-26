@@ -1,0 +1,279 @@
+/**
+ * @file Gage.cpp
+ * @brief Rain gage processing — numerically identical to legacy gage.c.
+ * @ingroup new_engine
+ *
+ * @author   Caleb Buahin <caleb.buahin@gmail.com>
+ * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
+ * @license  MIT License
+ */
+
+#include "Gage.hpp"
+#include "../core/SimulationContext.hpp"
+#include "../core/DateTime.hpp"
+#include <cmath>
+#include <algorithm>
+#include <cstdio>
+
+namespace openswmm {
+namespace gage {
+
+double convertRainfall(double raw_value, GageState& state) {
+    double r = 0.0;
+
+    switch (state.rain_type) {
+        case RainType::INTENSITY:
+            r = raw_value;
+            break;
+
+        case RainType::VOLUME:
+            if (state.rain_interval > 0.0)
+                r = raw_value / state.rain_interval * 3600.0;
+            break;
+
+        case RainType::CUMULATIVE:
+            if (state.rain_interval > 0.0) {
+                if (raw_value < state.rain_accum) {
+                    // Reset on decrease (new event)
+                    r = raw_value / state.rain_interval * 3600.0;
+                } else {
+                    r = (raw_value - state.rain_accum) / state.rain_interval * 3600.0;
+                }
+                state.rain_accum = raw_value;
+            }
+            break;
+    }
+
+    return r * state.units_factor * state.scale_factor * state.adjust_factor;
+}
+
+void separatePrecip(GageState& state, double intensity,
+                    double temperature, double snow_temp) {
+    if (temperature <= snow_temp) {
+        state.snowfall = intensity * state.snow_factor;
+        state.rainfall = 0.0;
+    } else {
+        state.rainfall = intensity;
+        state.snowfall = 0.0;
+    }
+    state.total_precip = state.rainfall + state.snowfall;
+}
+
+void updatePastRain(GageState& state, double current_time) {
+    // Update every hour (3600 seconds)
+    if (current_time - state.past_rain_time >= 3600.0) {
+        // Shift past rain array backward
+        for (int i = MAXPASTRAIN - 1; i > 0; --i) {
+            state.past_rain[i] = state.past_rain[i - 1];
+        }
+        state.past_rain[0] = state.past_rain_accum;
+        state.past_rain_accum = 0.0;
+        state.past_rain_time = current_time;
+    }
+
+    // Accumulate current rainfall (intensity * 1 second => depth per second)
+    state.past_rain_accum += state.rainfall / 3600.0;
+}
+
+double getPastRain(const GageState& state, int hours) {
+    if (hours <= 0 || hours > MAXPASTRAIN) return 0.0;
+    double total = 0.0;
+    for (int i = 0; i < hours; ++i) {
+        total += state.past_rain[i];
+    }
+    return total;
+}
+
+void updateAllGages(SimulationContext& ctx, double current_time) {
+    // current_time is absolute OADate (days since 12/30/1899) in fractional days
+    for (int j = 0; j < ctx.n_gages(); ++j) {
+        auto uj = static_cast<std::size_t>(j);
+
+        // Check API rainfall override (-1.0 means no override)
+        if (ctx.gages.api_rainfall[uj] >= 0.0) {
+            ctx.gages.rainfall[uj] = ctx.gages.api_rainfall[uj];
+            continue;
+        }
+
+        // Gap #53: co-gage sharing — copy rainfall from the primary gage that
+        // shares this gage's timeseries.  Matches legacy gage_setState() coGage path.
+        // The primary's rainfall already has its own scale_factor baked in, so
+        // we strip it and multiply by this gage's scale_factor (legacy gage.c:355).
+        int co = (uj < ctx.gages.co_gage_index.size())
+                 ? ctx.gages.co_gage_index[uj] : -1;
+        if (co >= 0 && co < j) {
+            const auto uco = static_cast<std::size_t>(co);
+            double primary_sf = ctx.gages.scale_factor[uco];
+            double this_sf    = ctx.gages.scale_factor[uj];
+            double ratio = (primary_sf > 0.0) ? (this_sf / primary_sf) : 1.0;
+            ctx.gages.rainfall[uj] = ctx.gages.rainfall[uco] * ratio;
+            continue;
+        }
+
+        // Read gage properties
+        int rain_type = ctx.gages.rain_type[uj];
+        double interval = ctx.gages.interval_sec[uj]; // seconds
+
+        // Look up raw rainfall from timeseries using step-function (piecewise constant).
+        // Matches legacy gage_setState() exactly:
+        //   1. Adds OneSecond offset to time for robust boundary comparison
+        //   2. Rain applies for [entryTime, entryTime + rainInterval)
+        //   3. Returns 0 in gaps between end-of-interval and next entry
+        //   4. Returns 0 after the last time series entry
+        //   5. Uses datetime::addSeconds for interval end computation
+        //      (decompose-recompose via integer H:M:S — deterministic rounding)
+        double t = current_time + datetime::OneSecond;
+
+        int ts_idx = ctx.gages.ts_index[uj];
+        double raw_value = 0.0;
+        // Select the source series: a FILE_RAIN gage reads from its own resolved
+        // rain_series (built by load_external_rain_files); a TIMESERIES gage reads
+        // from the shared table pool.  Both reuse the identical step-function below.
+        Table* rtbl = nullptr;
+        if (ctx.gages.source[uj] == RainSource::FILE_RAIN) {
+            if (uj < ctx.gages.rain_series.size() && !ctx.gages.rain_series[uj].empty())
+                rtbl = &ctx.gages.rain_series[uj];
+        } else if (ts_idx >= 0 && ts_idx < static_cast<int>(ctx.tables.tables.size())) {
+            rtbl = &ctx.tables.tables[static_cast<std::size_t>(ts_idx)];
+        }
+        if (rtbl) {
+            auto& tbl = *rtbl;
+            int n = static_cast<int>(tbl.x.size());
+
+            // Step-function lookup: find rightmost entry where x[idx] <= t
+            raw_value = table_step_cursor(tbl, t);
+
+            int idx = tbl.cursor.index;
+            if (idx >= 0 && idx < n) {
+                double entry_start = tbl.x[static_cast<std::size_t>(idx)];
+                // Use legacy-identical datetime arithmetic for interval end
+                double entry_end = datetime::addSeconds(entry_start, interval);
+
+                if (t >= entry_end) {
+                    // Past end of this entry's rain interval.
+                    // Check if there's a next entry and t has reached it.
+                    int next_idx = idx + 1;
+                    if (next_idx < n && t >= tbl.x[static_cast<std::size_t>(next_idx)]) {
+                        // Advance to the next entry
+                        raw_value = tbl.y[static_cast<std::size_t>(next_idx)];
+                        tbl.cursor.index = next_idx;
+                        // Check if we're also past this next entry's interval
+                        double next_end = datetime::addSeconds(
+                            tbl.x[static_cast<std::size_t>(next_idx)], interval);
+                        if (t >= next_end) {
+                            raw_value = 0.0; // In gap after next entry too
+                        }
+                    } else {
+                        // In dry gap between entries, or past last entry
+                        raw_value = 0.0;
+                    }
+                }
+            }
+        }
+
+        if (rain_type == 1 && interval > 0.0) {
+            // VOLUME: value is depth per interval → convert to in/hr.
+            // Match legacy gage.c:692 operand order exactly: r/interval*3600.0
+            // (one divide then one multiply), NOT r/(interval/3600.0) which forms
+            // the non-representable 1/12 constant first and rounds differently.
+            raw_value = raw_value / interval * 3600.0;
+        } else if (rain_type == 2 && interval > 0.0) {
+            // CUMULATIVE (Gap #31): raw_value is cumulative depth; compute delta.
+            // Matches legacy convertRainfall() CUMULATIVE_RAINFALL case:
+            //   if new < accum (counter reset) → treat new value as depth this interval
+            //   else → delta = new - accum (depth this interval)
+            //   always update accumulator with new raw value
+            double prev = ctx.gages.cumul_rain_accum[uj];
+            double depth = (raw_value < prev)
+                ? raw_value              // counter reset — use full value as depth
+                : (raw_value - prev);    // normal incremental delta
+            ctx.gages.cumul_rain_accum[uj] = raw_value;
+            raw_value = depth / interval * 3600.0;  // depth → in/hr (legacy gage.c:697 order)
+        }
+        // INTENSITY (type 0): already in/hr — no conversion needed
+
+        // Apply per-gage rainfall scaling factor (legacy gage.c:704 convertRainfall).
+        // Default scale_factor is 1.0 so unmarked gages are unaffected.
+        raw_value *= ctx.gages.scale_factor[uj];
+
+        // Convert from in/hr to ft/sec for internal use
+        // Legacy: rainfall stored as in/hr for reporting, converted to ft/sec for runoff
+        // We store in in/hr (project rain units) and convert in the runoff solver
+        ctx.gages.rainfall[uj] = raw_value;
+
+        // Update past-rain history (hourly buckets for control rules)
+        {
+            constexpr int MPR = GageData::MAXPASTRAIN;
+            double ct_sec = current_time * 86400.0; // to seconds for comparison
+            double last = ctx.gages.past_rain_time[uj];
+            if (ct_sec - last >= 3600.0) {
+                // Shift ring buffer backward
+                auto base = uj * static_cast<std::size_t>(MPR);
+                for (int k = MPR - 1; k > 0; --k)
+                    ctx.gages.past_rain[base + static_cast<std::size_t>(k)] =
+                        ctx.gages.past_rain[base + static_cast<std::size_t>(k - 1)];
+                ctx.gages.past_rain[base] = ctx.gages.past_rain_accum[uj];
+                ctx.gages.past_rain_accum[uj] = 0.0;
+                ctx.gages.past_rain_time[uj] = ct_sec;
+            }
+            // Accumulate: rainfall (in/hr) * (1 second / 3600)
+            ctx.gages.past_rain_accum[uj] += raw_value / 3600.0;
+        }
+    }
+}
+
+double getReportRainfall(const SimulationContext& ctx, int gage_idx,
+                         double report_date) {
+    auto ug = static_cast<std::size_t>(gage_idx);
+
+    // API override
+    if (ctx.gages.api_rainfall[ug] >= 0.0) {
+        return ctx.gages.api_rainfall[ug];
+    }
+
+    // Query timeseries at report_date (matching legacy gage_setReportRainfall)
+    int ts_idx = ctx.gages.ts_index[ug];
+    if (ts_idx < 0 || ts_idx >= static_cast<int>(ctx.tables.tables.size()))
+        return 0.0;
+
+    const auto& tbl = ctx.tables.tables[static_cast<std::size_t>(ts_idx)];
+    int n = static_cast<int>(tbl.x.size());
+    int idx = tbl.cursor.index;
+    if (idx < 0 || idx >= n) return 0.0;
+
+    double interval = ctx.gages.interval_sec[ug];
+    double t = report_date + datetime::OneSecond;
+
+    double entry_start = tbl.x[static_cast<std::size_t>(idx)];
+    double entry_end = datetime::addSeconds(entry_start, interval);
+
+    double result;
+    if (t < entry_end) {
+        // Report time is within current rain interval
+        result = tbl.y[static_cast<std::size_t>(idx)];
+    } else {
+        // Check next entry
+        int next_idx = idx + 1;
+        if (next_idx < n && t >= tbl.x[static_cast<std::size_t>(next_idx)]) {
+            result = tbl.y[static_cast<std::size_t>(next_idx)];
+        } else {
+            result = 0.0; // In dry gap between entries
+        }
+    }
+
+    // Convert VOLUME to INTENSITY if needed
+    int rain_type = ctx.gages.rain_type[ug];
+    if (rain_type == 1 && interval > 0.0) {
+        result = result / (interval / 3600.0);
+    }
+
+    // Per-gage rainfall scaling factor (legacy gage_setReportRainfall co-gage
+    // branch reduces to this: each gage applies its own scale_factor to the
+    // shared timeseries value).
+    result *= ctx.gages.scale_factor[ug];
+
+    return result;
+}
+
+} // namespace gage
+} // namespace openswmm

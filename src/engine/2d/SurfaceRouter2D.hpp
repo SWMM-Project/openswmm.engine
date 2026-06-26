@@ -1,0 +1,287 @@
+/**
+ * @file SurfaceRouter2D.hpp
+ * @brief Top-level orchestrator for the optional 2D surface routing module.
+ *
+ * @details Manages the full 2D workflow within the engine lifecycle:
+ *          - Mesh topology construction (after parse)
+ *          - CVODE solver initialization
+ *          - Per-step coupling, rainfall update, solver advance
+ *          - Statistics and finalization
+ *
+ *          Integrates with SWMMEngine via lifecycle hooks:
+ *          initialize() → step() → finalize()
+ *
+ * @see TWO_DIMENSIONAL_SURFACE_ROUTING_IMPLEMENTATION_STRATEGY.md §4.1, §8.3
+ * @ingroup engine_2d
+ *
+ * @author   Caleb Buahin <caleb.buahin@gmail.com>
+ * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
+ * @license  MIT License
+ */
+
+#ifndef OPENSWMM_ENGINE_2D_SURFACE_ROUTER_HPP
+#define OPENSWMM_ENGINE_2D_SURFACE_ROUTER_HPP
+
+#include "data/MeshData.hpp"
+#include "data/SurfaceStateData.hpp"
+#include "data/SolverOptions2D.hpp"
+#include "data/BoundaryData.hpp"
+#include "data/PendingRows2D.hpp"
+#include "coupling/NodeCoupling.hpp"
+
+#include <memory>
+#include <fstream>
+
+#ifdef OPENSWMM_HAS_2D
+#include "solver/ISurfaceSolver.hpp"
+#endif
+
+namespace openswmm {
+struct SimulationContext;
+}
+
+namespace openswmm::twoD {
+
+/**
+ * @brief Top-level orchestrator for the 2D surface routing module.
+ */
+class SurfaceRouter2D {
+public:
+    SurfaceRouter2D() = default;
+    ~SurfaceRouter2D() = default;
+
+    // Non-copyable, movable
+    SurfaceRouter2D(const SurfaceRouter2D&) = delete;
+    SurfaceRouter2D& operator=(const SurfaceRouter2D&) = delete;
+    SurfaceRouter2D(SurfaceRouter2D&&) = default;
+    SurfaceRouter2D& operator=(SurfaceRouter2D&&) = default;
+
+    /**
+     * @brief Initialize the 2D module after input parsing is complete.
+     *
+     * Builds mesh topology, vertex stencils, resolves coupling names,
+     * and initializes the CVODE solver.
+     *
+     * @param ctx Simulation context (must have mesh_2d populated from parsing).
+     */
+    void initialize(SimulationContext& ctx);
+
+    /**
+     * @brief Advance the 2D surface routing by one SWMM routing step.
+     *
+     * Sequence:
+     * 1. Update outfall boundary heads from 2D state (before 1D routing)
+     * 2. After 1D routing: compute coupling exchange flows
+     * 3. Update 2D rainfall from system gages
+     * 4. Advance CVODE by dt_swmm
+     * 5. Transfer outfall discharges into 2D cells
+     * 6. Update statistics
+     *
+     * @param ctx  Simulation context.
+     * @param dt   SWMM routing timestep (seconds).
+     * @param t    Current simulation time (seconds from start).
+     */
+    void step(SimulationContext& ctx, double dt, double t);
+
+    /**
+     * @brief Pre-routing hook: update outfall boundaries from 2D surface heads.
+     *
+     * Must be called BEFORE the 1D routing step, after setOutfallDepths().
+     *
+     * @param ctx Simulation context.
+     */
+    void updateOutfallsPreRouting(SimulationContext& ctx);
+
+    /**
+     * @brief Post-routing hook: compute coupling exchange and advance 2D solver.
+     *
+     * Must be called AFTER the 1D routing step.
+     *
+     * @param ctx  Simulation context.
+     * @param dt   SWMM routing timestep (seconds).
+     * @param t    Current simulation time (seconds from start).
+     */
+    void advancePostRouting(SimulationContext& ctx, double dt, double t);
+
+    /**
+     * @brief Finalize the 2D module at simulation end.
+     */
+    void finalize();
+
+    /**
+     * @brief Compute a CFL-like stability hint for the 2D domain.
+     *
+     * Returns an advisory maximum dt based on mesh resolution and wave speeds.
+     * CVODE handles its own sub-stepping, but this prevents the coupling
+     * interval from being too large.
+     *
+     * @param ctx Simulation context.
+     * @return Advisory maximum timestep (seconds).
+     */
+    double computeCflHint(const SimulationContext& ctx) const;
+
+    /// Check if the 2D module is active.
+    bool isActive() const noexcept { return active_; }
+
+    /**
+     * @brief Make the parsed mesh editable without a full initialize().
+     *
+     * The GUI keeps the engine in OPENED (not INITIALIZED) state so 1D
+     * property edits stay legal. In that state the 2D mesh is parsed but the
+     * [2D_BOUNDARY_CONDITIONS] / [2D_EDGE_CONVEYANCE] rows still live in the
+     * pending-row buffers, which the serializer prefers over live state. This
+     * drains those rows into BoundaryData / mesh edge slots (the same drain
+     * initialize() performs) so per-edge API edits take effect and are written
+     * on save. No-op once drained or when no mesh is loaded.
+     */
+    void prepareForEdit();
+
+    /// Access mesh data (read-only).
+    const MeshData& mesh() const noexcept { return mesh_; }
+
+    /// Access mesh data (mutable, for input parsing).
+    MeshData& mesh() noexcept { return mesh_; }
+
+    /// Access surface state (read-only).
+    const SurfaceStateData& state() const noexcept { return state_; }
+
+    /// Access surface state (mutable, for forcing).
+    SurfaceStateData& state() noexcept { return state_; }
+
+    /// Access solver options (read-only).
+    const SolverOptions2D& options() const noexcept { return options_; }
+
+    /// Access solver options (mutable).
+    SolverOptions2D& options() noexcept { return options_; }
+
+    /// Access per-edge boundary-condition data (read-only).
+    const BoundaryData& boundary() const noexcept { return boundary_; }
+
+    /// Access per-edge boundary-condition data (mutable, for forcing/parsing).
+    BoundaryData& boundary() noexcept { return boundary_; }
+
+    /**
+     * @brief Per-row buffer for `[2D_BOUNDARY_CONDITIONS]` parse output.
+     *
+     * V-E3. Populated by the input parser during reading (before the
+     * mesh is finalized), drained into `boundary_` during `initialize()`
+     * after `boundary_.resize()` allocates the per-edge slots. Retained
+     * after the drain so serialization (InpWriter / GeoPackage) can
+     * re-emit the authored rows (group label, TS-vs-constant choice).
+     * Hoisted to data/PendingRows2D.hpp; alias kept for call sites.
+     */
+    using PendingBoundaryRow = twoD::PendingBoundaryRow;
+    std::vector<PendingBoundaryRow>& pendingBCRows() noexcept { return pending_bc_rows_; }
+    const std::vector<PendingBoundaryRow>& pendingBCRows() const noexcept { return pending_bc_rows_; }
+
+    /**
+     * @brief Per-row buffer for `[2D_EDGE_CONVEYANCE]` parse output (§11A).
+     *
+     * Populated by the input parser during reading (vertices known but
+     * mesh topology not yet built), drained into `mesh_.edge_conveyance`
+     * during `initialize()` after `buildMeshTopology` has populated the
+     * neighbour table. Mirrored to both slots of an interior edge so
+     * antisymmetric FV flux integration stays mass-conservative.
+     * Retained after the drain for faithful re-serialization.
+     */
+    using PendingEdgeConveyanceRow = twoD::PendingEdgeConveyanceRow;
+    std::vector<PendingEdgeConveyanceRow>& pendingEdgeConveyanceRows() noexcept {
+        return pending_edge_conveyance_rows_;
+    }
+    const std::vector<PendingEdgeConveyanceRow>& pendingEdgeConveyanceRows() const noexcept {
+        return pending_edge_conveyance_rows_;
+    }
+
+    /// Get total 2D surface volume (sum of depth * area).
+    double totalVolume() const;
+
+    /// Get total exchange flow (sum of coupling flows, m³/s).
+    double totalExchangeFlow() const;
+
+#ifdef OPENSWMM_HAS_2D
+    /// Access CVODE solver statistics.
+    long lastCvodeSteps() const {
+        return solver_ ? solver_->last_num_steps() : 0;
+    }
+    double lastCvodeStepSize() const {
+        return solver_ ? solver_->last_step_size() : 0.0;
+    }
+#else
+    long lastCvodeSteps() const { return 0; }
+    double lastCvodeStepSize() const { return 0.0; }
+#endif
+
+private:
+    /// Drain pending [2D_BOUNDARY_CONDITIONS] / [2D_EDGE_CONVEYANCE] rows into
+    /// BoundaryData / mesh edge slots and flip pending_rows_drained. Shared by
+    /// initialize() and prepareForEdit(); idempotent.
+    void drainPendingRows();
+
+    MeshData         mesh_;
+    SurfaceStateData state_;
+    SolverOptions2D  options_;
+    BoundaryData     boundary_;
+
+    /// V-E3 — parse-time scratch for [2D_BOUNDARY_CONDITIONS] rows.
+    std::vector<PendingBoundaryRow> pending_bc_rows_;
+
+    /// §11A — parse-time scratch for [2D_EDGE_CONVEYANCE] rows.
+    /// Drained in initialize() into mesh_.edge_conveyance after
+    /// buildMeshTopology populates the neighbour table.
+    std::vector<PendingEdgeConveyanceRow> pending_edge_conveyance_rows_;
+
+    std::vector<CouplingPoint> coupling_points_;
+
+    bool   active_           = false;
+    int    coupling_counter_ = 0;
+    double sim_time_         = 0.0;
+
+    /// Previous cumulative boundary flux (Σ edge_bc_cum_flux, m³), for the
+    /// per-step delta in the global mass balance.
+    double prev_boundary_cum_ = 0.0;
+
+    /// One-shot guard: resolve deferred boundary timeseries/curve NAMES to
+    /// registry indices on the first advance (ctx.table_names is populated by
+    /// then), not at parse time.
+    bool boundary_names_resolved_ = false;
+
+    // -----------------------------------------------------------------------
+    // Stiffness-attribution diagnostic CSV (opt-in via OPENSWMM_2D_DIAG_CSV).
+    // One row per executed 2D advance: per-advance CVODE counter deltas
+    // correlated with the wet/dry-front size and the coupling-exchange
+    // magnitude, so the wet/dry vs coupling stiffness contributions can be
+    // separated. Disabled (null stream) unless the env var names a path.
+    // -----------------------------------------------------------------------
+    std::unique_ptr<std::ofstream> diag_csv_;   ///< open output stream, or null
+    bool diag_checked_   = false;               ///< env var resolved once
+    int  diag_prev_nwet_ = 0;                   ///< previous wet-cell count (for dn_wet)
+    void writeDiagRow(SimulationContext& ctx, double dt, double t);
+
+#ifdef OPENSWMM_HAS_2D
+    /// Time integrator, chosen at runtime. Default is the serial CPU
+    /// CvodeSurfaceSolver (constructed in initialize()); a future GPU plugin
+    /// backend slots in here without touching SurfaceRouter2D. See
+    /// docs/2D_GPU_PORTABLE_CVODE_STRATEGY.md §2.1.
+    std::unique_ptr<ISurfaceSolver> solver_;
+#endif
+
+    /// Update rainfall from system rain gages.
+    void updateRainfall(SimulationContext& ctx);
+
+    /// Resolve per-step boundary driving values: evaluate SPECIFIED_STAGE /
+    /// SPECIFIED_FLOW timeseries at time @p t and RATING_CURVE from the boundary
+    /// cell stage into edge_bc_head / edge_bc_flow (which the flux kernels read).
+    /// Resolves deferred timeseries/curve names to registry indices once. No-op
+    /// for WALL / NORMAL_FLOW and for constant SPECIFIED_* edges.
+    void resolveBoundaryValues(SimulationContext& ctx, double t);
+
+    /// Accumulate the global 2D mass-balance terms for one executed step
+    /// into ctx.mass_balance_2d (rainfall, coupling, outfall, boundary,
+    /// latest storage) and the evaporation loss into state_.evap_loss_total.
+    /// All terms in the 2D solver's SI internal units (m³).
+    void accumulateMassBalance(SimulationContext& ctx, double dt);
+};
+
+} // namespace openswmm::twoD
+
+#endif // OPENSWMM_ENGINE_2D_SURFACE_ROUTER_HPP
